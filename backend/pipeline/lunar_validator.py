@@ -91,6 +91,17 @@ def validate_lunar_image(gray: np.ndarray) -> dict:
             {"edge_density": edge_density},
         )
 
+    # Check 6: Reject obvious diagrams/screenshots (many straight lines)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=min(h, w) // 6, maxLineGap=15)
+    if lines is not None:
+        n_lines = len(lines)
+        line_ratio = n_lines / (h * w) * 10000
+        if line_ratio > 8.0:
+            raise LunarValidationError(
+                "Image appears to be a diagram or screenshot. Upload a lunar surface photo.",
+                {"line_ratio": round(line_ratio, 2), "n_lines": n_lines},
+            )
+
     return {
         "valid": True,
         "keypoints": n_keypoints,

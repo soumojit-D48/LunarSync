@@ -13,7 +13,16 @@ def match_pair_sift(user_proc: np.ndarray, ref_proc: np.ndarray) -> dict:
 
     Returns keypoints in FULL working-resolution coordinates plus fit stats.
     """
-    sift = cv2.SIFT_create(nfeatures=5000, contrastThreshold=0.002, edgeThreshold=20)
+    # Resize for speed — SIFT on full-res lunar frames is too slow on CPU
+    max_dim = 800
+    uh, uw = user_proc.shape
+    rh, rw = ref_proc.shape
+    u_scale = min(1.0, max_dim / max(uh, uw))
+    r_scale = min(1.0, max_dim / max(rh, rw))
+    u_img = cv2.resize(user_proc, (int(uw * u_scale), int(uh * u_scale)), interpolation=cv2.INTER_AREA) if u_scale < 1.0 else user_proc
+    r_img = cv2.resize(ref_proc, (int(rw * r_scale), int(rh * r_scale)), interpolation=cv2.INTER_AREA) if r_scale < 1.0 else ref_proc
+
+    sift = cv2.SIFT_create(nfeatures=2000, contrastThreshold=0.002, edgeThreshold=20)
 
     kp0, desc0 = sift.detectAndCompute(user_proc, None)
     kp1, desc1 = sift.detectAndCompute(ref_proc, None)
@@ -61,6 +70,12 @@ def match_pair_sift(user_proc: np.ndarray, ref_proc: np.ndarray) -> dict:
     if n_candidates >= 6:
         mkpts0 = np.float32([kp0[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
         mkpts1 = np.float32([kp1[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
+
+        # Scale back to full resolution
+        mkpts0[:, 0] /= u_scale
+        mkpts0[:, 1] /= u_scale
+        mkpts1[:, 0] /= r_scale
+        mkpts1[:, 1] /= r_scale
 
         H_fit, inliers = cv2.findHomography(mkpts0, mkpts1, cv2.USAC_MAGSAC, 3.0, 0.99, 3000)
         if H_fit is not None:

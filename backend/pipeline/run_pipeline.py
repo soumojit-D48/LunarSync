@@ -114,8 +114,12 @@ def _validate_footprint(H: np.ndarray, shape: tuple) -> tuple:
 
 
 def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
-                   t0: float, on_stage) -> dict:
-    """Core single-pair run on decoded grayscale arrays."""
+                   t0: float, on_stage, sift_budget: list = None) -> dict:
+    """Core single-pair run on decoded grayscale arrays.
+
+    sift_budget is a mutable [remaining] counter — SIFT fallback only runs
+    while budget remains, so a full sweep doesn't call SIFT on every frame.
+    """
     report_stage = on_stage or (lambda _s: None)
     user_h, user_w = user_raw.shape
     ref_h, ref_w = ref_raw.shape
@@ -129,8 +133,10 @@ def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
     on_stage("matching")
     m = match_pair(user_proc, ref_proc)
 
-    # Fallback: if LoFTR is weak, try SIFT+RootSIFT
-    if m["n_candidates"] < 10 or m["inlier_count"] < 10:
+    # Fallback: if LoFTR is weak, try SIFT+RootSIFT (budget-limited)
+    if (m["n_candidates"] < 10 or m["inlier_count"] < 10) and (sift_budget is None or sift_budget[0] > 0):
+        if sift_budget is not None:
+            sift_budget[0] -= 1
         m_sift = match_pair_sift(user_proc, ref_proc)
         if m_sift["inlier_count"] > m["inlier_count"]:
             m = m_sift
@@ -215,7 +221,7 @@ def run_registration(src_bytes: bytes, ref_bytes: bytes, on_stage=None) -> dict:
     ref_raw = _decode_gray(ref_bytes)
     report_stage("preprocessing")
     validate_lunar_image(user_raw)
-    out = _register_pair(user_raw, ref_raw, t0, report_stage)
+    out = _register_pair(user_raw, ref_raw, t0, report_stage, sift_budget=None)
     _require_usable_match(out)
     return out
 
@@ -235,12 +241,13 @@ def sweep_archive(src_bytes: bytes, ref_files: list,
     validate_lunar_image(user_raw)
 
     sweep, best, best_result = [], None, None
+    sift_budget = [3]  # max 3 SIFT fallback calls per sweep
     for path in ref_files:
         loop_t0 = time.time()
         report_stage("preprocessing")
         try:
             ref_raw = _decode_gray(path.read_bytes())
-            out = _register_pair(user_raw, ref_raw, loop_t0, report_stage)
+            out = _register_pair(user_raw, ref_raw, loop_t0, report_stage, sift_budget=sift_budget)
         except Exception as exc:  # noqa: BLE001 — one bad frame must not kill the sweep
             sweep.append({"file": path.name, "score": 0.0, "inliers": 0,
                           "rmse": 0.0, "error": str(exc)[:120]})
