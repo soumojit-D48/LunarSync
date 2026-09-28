@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from pipeline.lunar_validator import LunarValidationError
 from pipeline.run_pipeline import VALID_EXTENSIONS, run_registration, sweep_archive
 
 BASE = Path(__file__).resolve().parent
@@ -101,6 +102,12 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
         }
         job["status"] = "SUCCEEDED"
         job["currentStage"] = "evaluation"
+    except LunarValidationError as exc:
+        job["status"] = "FAILED"
+        job["currentStage"] = "outlier_rejection"
+        job["errorMessage"] = exc.reason
+        if exc.details:
+            job["validation"] = exc.details
     except Exception as exc:  # noqa: BLE001 — surfaced to the UI, never silent
         job["status"] = "FAILED"
         job["errorMessage"] = str(exc)[:500]

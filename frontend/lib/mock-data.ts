@@ -64,6 +64,11 @@ export type Job = {
   matcherType: MatcherType;
   transformModel: TransformModel;
   errorMessage?: string;
+  validation?: {
+    inliers?: number;
+    inlier_ratio?: number;
+    coverage?: number;
+  };
   createdAt: string;
   startedAt?: string;
   completedAt?: string;

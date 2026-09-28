@@ -141,6 +141,11 @@ export default function JobDetail({ id }: { id: string }) {
             {job.status === "FAILED" ? (
               <div className="mt-6 rounded-xl bg-destructive/10 p-5 font-mono text-xs leading-relaxed text-destructive ring-1 ring-destructive/30">
                 FAILED AT {job.currentStage.toUpperCase()} — {job.errorMessage}
+                {job.validation ? (
+                  <div className="mt-2 text-destructive/80">
+                    ARCHIVE EVIDENCE: {job.validation.inliers ?? 0} inliers · {((job.validation.inlier_ratio ?? 0) * 100).toFixed(1)}% ratio · {((job.validation.coverage ?? 0) * 100).toFixed(1)}% coverage
+                  </div>
+                ) : null}
               </div>
             ) : null}
 

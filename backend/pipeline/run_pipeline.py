@@ -13,8 +13,10 @@ import time
 import cv2
 import numpy as np
 
+from .lunar_validator import validate_lunar_image, LunarValidationError
 from .matching import match_pair
 from .preprocessing import run_loop_27_preprocessing
+from .sift_matching import match_pair_sift
 
 DISPLAY_W, DISPLAY_H = 800, 450
 MAX_MATCHES = 150
@@ -62,11 +64,59 @@ def _coverage(matches: list) -> float:
     return len(cells) / (GRID_COLS * GRID_ROWS)
 
 
+def _require_usable_match(out: dict) -> None:
+    """Reject a plausible-looking but weak geometric fit.
+
+    Four points can always produce a homography with an artificially tiny
+    residual. The notebook avoids returning those fits; apply the same gate
+    here so unrelated uploads do not produce a confident-looking warp.
+    """
+    report = out["report"]
+    if (
+        report["inlierCount"] < 10
+        or report["inlierRatio"] < 0.15
+        or not report.get("footprintValid", False)
+    ):
+        raise LunarValidationError(
+            "Uploaded image does not appear to be a lunar surface frame — no reliable correspondence found in the archive.",
+            {
+                "inliers": report["inlierCount"],
+                "inlier_ratio": report["inlierRatio"],
+                "coverage": report["coverageScore"],
+            },
+        )
+
+
+def _validate_footprint(H: np.ndarray, shape: tuple) -> tuple:
+    """Reject degenerate homographies that collapse the image footprint.
+
+    Adapted from the Outlier Rejection notebook's validate_transformed_footprint.
+    """
+    h, w = shape
+    corners = np.float32([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]])
+    try:
+        transformed = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), H)
+    except cv2.error:
+        return False, 0.0
+    if not np.isfinite(transformed).all():
+        return False, 0.0
+    area = abs(float(cv2.contourArea(transformed)))
+    original_area = max(float((w - 1) * (h - 1)), 1.0)
+    area_ratio = area / original_area
+    if area <= 1.0 or area_ratio < 1e-3:
+        return False, area_ratio
+    try:
+        if not cv2.isContourConvex(transformed):
+            return False, area_ratio
+    except cv2.error:
+        return False, area_ratio
+    return True, area_ratio
+
+
 def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
                    t0: float, on_stage) -> dict:
     """Core single-pair run on decoded grayscale arrays."""
     report_stage = on_stage or (lambda _s: None)
-    # GSD alignment: rescale reference height to user height (notebook §scale handling)
     user_h, user_w = user_raw.shape
     ref_h, ref_w = ref_raw.shape
     scale = user_h / max(ref_h, 1)
@@ -78,6 +128,12 @@ def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
     on_stage("feature_extraction")
     on_stage("matching")
     m = match_pair(user_proc, ref_proc)
+
+    # Fallback: if LoFTR is weak, try SIFT+RootSIFT
+    if m["n_candidates"] < 10 or m["inlier_count"] < 10:
+        m_sift = match_pair_sift(user_proc, ref_proc)
+        if m_sift["inlier_count"] > m["inlier_count"]:
+            m = m_sift
 
     on_stage("outlier_rejection")
     mk0, mk1, mask = m["mkpts0"], m["mkpts1"], m["inlier_mask"]
@@ -97,8 +153,14 @@ def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
     H = m["H"]
     rmse = m["rmse"] if m["rmse"] != 999.0 else 0.0
 
+    footprint_valid, area_ratio = _validate_footprint(H, user_proc.shape)
+    if not footprint_valid:
+        raise LunarValidationError(
+            "Geometric outlier rejection discarded the proposed alignment.",
+            {"footprint_area_ratio": round(area_ratio, 6)},
+        )
+
     report_stage("warping")
-    # Warped preview on display canvases: map display-source -> display-ref.
     sx, sy = DISPLAY_W / user_proc.shape[1], DISPLAY_H / user_proc.shape[0]
     rx, ry = DISPLAY_W / ref_proc.shape[1], DISPLAY_H / ref_proc.shape[0]
     H_disp = np.array([[rx, 0, 0], [0, ry, 0], [0, 0, 1]]) @ H @ np.array(
@@ -133,6 +195,8 @@ def _register_pair(user_raw: np.ndarray, ref_raw: np.ndarray,
             "reliability": reliability, "reliabilityReason": reason,
             "matchPercentage": round(ratio * 100, 2),
             "candidates": m["n_candidates"],
+            "footprintValid": footprint_valid,
+            "footprintAreaRatio": round(area_ratio, 6),
         },
         "images": {
             "source": _encode_jpg(src_disp),
@@ -150,7 +214,10 @@ def run_registration(src_bytes: bytes, ref_bytes: bytes, on_stage=None) -> dict:
     user_raw = _decode_gray(src_bytes)
     ref_raw = _decode_gray(ref_bytes)
     report_stage("preprocessing")
-    return _register_pair(user_raw, ref_raw, t0, report_stage)
+    validate_lunar_image(user_raw)
+    out = _register_pair(user_raw, ref_raw, t0, report_stage)
+    _require_usable_match(out)
+    return out
 
 
 def sweep_archive(src_bytes: bytes, ref_files: list,
@@ -165,6 +232,7 @@ def sweep_archive(src_bytes: bytes, ref_files: list,
     report_stage = on_stage or (lambda _s: None)
     report_stage("ingestion")
     user_raw = _decode_gray(src_bytes)
+    validate_lunar_image(user_raw)
 
     sweep, best, best_result = [], None, None
     for path in ref_files:
@@ -190,7 +258,10 @@ def sweep_archive(src_bytes: bytes, ref_files: list,
             break
 
     if best_result is None:
-        raise RuntimeError("Archive sweep found no readable reference frame.")
+        raise LunarValidationError(
+            "No readable reference frame was available in the local archive."
+        )
+    _require_usable_match(best_result)
     sweep.sort(key=lambda e: e["score"], reverse=True)
     best_result["report"]["sweep"] = sweep
     best_result["report"]["processingTimeS"] = round(time.time() - t0, 2)
