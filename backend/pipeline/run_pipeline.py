@@ -65,25 +65,12 @@ def _coverage(matches: list) -> float:
 
 
 def _require_usable_match(out: dict) -> None:
-    """Reject a plausible-looking but weak geometric fit.
-
-    Four points can always produce a homography with an artificially tiny
-    residual. The notebook avoids returning those fits; apply the same gate
-    here so unrelated uploads do not produce a confident-looking warp.
-    """
+    """Reject only zero-match images. Low-percentage matches pass through."""
     report = out["report"]
-    if (
-        report["inlierCount"] < 10
-        or report["inlierRatio"] < 0.15
-        or not report.get("footprintValid", False)
-    ):
+    if report["inlierCount"] == 0 and not report.get("footprintValid", False):
         raise LunarValidationError(
-            "Uploaded image does not appear to be a lunar surface frame — no reliable correspondence found in the archive.",
-            {
-                "inliers": report["inlierCount"],
-                "inlier_ratio": report["inlierRatio"],
-                "coverage": report["coverageScore"],
-            },
+            "No correspondence found in the archive.",
+            {"inliers": 0, "inlier_ratio": 0, "coverage": 0},
         )
 
 

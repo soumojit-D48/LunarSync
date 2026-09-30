@@ -1,8 +1,12 @@
-"""LunaMatch demo backend — FastAPI over the notebook pipeline. No database:
-jobs live in an in-memory dict, image artifacts on local disk.
+"""LunaMatch dynamic backend — HF-backed archive sweep + notebook pipeline.
+
+No database: jobs live in an in-memory dict, image artifacts on local disk.
+Reference frames are dynamic: HF dataset (lunar-team-2026/data-image via
+HF_TOKEN in .env) first, local data/reference/ as offline fallback.
 """
 
-import io
+import json
+import os
 import threading
 import time
 import uuid
@@ -12,18 +16,32 @@ import cv2
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
+
+from pipeline.hf_matcher import parse_metadata as hf_parse_metadata
+from pipeline.hf_matcher import sweep as hf_sweep
+from pipeline.hf_matcher import to_frontend as hf_to_frontend
+from pipeline.hf_store import ensure_dataset, list_reference_images, status as hf_status
 from pipeline.lunar_validator import LunarValidationError
 from pipeline.run_pipeline import VALID_EXTENSIONS, run_registration, sweep_archive
 
 BASE = Path(__file__).resolve().parent
 ROOT = BASE.parent
 OUT_DIR = BASE / "static" / "outputs"
-# Primary archive: root data/reference (lat/lon filenames). Fallback: backend copy.
+JOB_STORE = BASE / "static" / "jobs.json"
 REF_DIRS = [ROOT / "data" / "reference", BASE / "data" / "reference"]
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+HF_LIMIT = int(os.getenv("HF_SWEEP_LIMIT", "0") or 0) or None
+HF_EARLY_STOP = float(os.getenv("HF_EARLY_STOP", "60.0") or 60.0)
+_HF_SNAPSHOT = None  # lazy-cached snapshot dir
 
 STAGES = ["ingestion", "preprocessing", "overlap_estimation", "feature_extraction",
           "matching", "outlier_rejection", "uniform_selection", "subpixel_refinement",
@@ -41,7 +59,42 @@ jobs: dict = {}
 _lock = threading.Lock()
 
 
+def _load_jobs():
+    if JOB_STORE.exists():
+        try:
+            data = json.loads(JOB_STORE.read_text(encoding="utf-8"))
+            for jid, job in data.items():
+                job.pop("result", None)
+                jobs[jid] = job
+        except Exception:
+            pass
+
+
+def _save_jobs():
+    try:
+        serializable = {}
+        for jid, job in jobs.items():
+            j = {k: v for k, v in job.items() if k not in ("result", "src_bytes", "ref_bytes")}
+            serializable[jid] = j
+        JOB_STORE.write_text(json.dumps(serializable, indent=2, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_load_jobs()
+
+
 def _archive_files() -> list:
+    """Dynamic listing: HF snapshot first, local dirs as fallback."""
+    global _HF_SNAPSHOT
+    if _HF_SNAPSHOT is None:
+        try:
+            _HF_SNAPSHOT = ensure_dataset()
+        except Exception:
+            _HF_SNAPSHOT = None
+    files = list_reference_images(_HF_SNAPSHOT, REF_DIRS)
+    if files:
+        return files
     for d in REF_DIRS:
         if d.exists():
             files = sorted(p for p in d.iterdir()
@@ -58,6 +111,38 @@ def _default_reference() -> bytes:
     return files[0].read_bytes()
 
 
+def _clean_sweep(rows: list) -> list:
+    """Strip any non-JSON internals; coerce numpy scalars to plain types."""
+    clean = []
+    for r in rows or []:
+        try:
+            clean.append({
+                "file": str(r.get("file", "?")),
+                "lat": str(r.get("lat", "?")),
+                "lon": str(r.get("lon", "?")),
+                "score": float(r.get("score", 0.0)),
+                "inliers": int(r.get("inliers", 0)),
+                "rmse": float(r.get("rmse", 0.0)),
+                "overlap": float(r.get("overlap", 0.0)),
+                "iou": float(r.get("iou", 0.0)),
+                "model": str(r.get("model", "?")),
+                "runtimeS": float(r.get("runtimeS", 0.0)),
+            })
+        except Exception:
+            continue
+    return clean
+
+
+def _decode_gray(data: bytes):
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError("Could not decode image (use PNG/JPG/TIF).")
+    if img.shape[0] > img.shape[1]:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    return img
+
+
 def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
     job = jobs[job_id]
     try:
@@ -66,24 +151,44 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
 
         def on_stage(stage: str):
             job["currentStage"] = stage
+            with _lock:
+                _save_jobs()
 
         if ref_bytes is not None:
             # Explicit pair: user uploaded both frames.
             out = run_registration(src_bytes, ref_bytes, on_stage=on_stage)
         else:
-            # Archive mode: sweep root data/reference, keep the winner.
+            # Dynamic archive mode: HF dataset first, local fallback.
+            from pipeline.lunar_validator import validate_lunar_image
+
+            t0 = time.time()
+            on_stage("ingestion")
+            query_img = _decode_gray(src_bytes)
+            on_stage("preprocessing")
+            validate_lunar_image(query_img)
             files = _archive_files()
             if not files:
-                raise RuntimeError("Archive empty: add frames to data/reference/.")
-            out = sweep_archive(src_bytes, files, on_stage=on_stage)
-            winner = out.get("winner") or {}
+                raise RuntimeError(
+                    "Archive empty: check HF_TOKEN/HF_DATASET or add frames to data/reference/."
+                )
+            sweep = hf_sweep(query_img, files, on_stage=on_stage,
+                             limit=HF_LIMIT, early_stop=HF_EARLY_STOP)
+            wres = sweep["winner_result"]
+            out = hf_to_frontend(query_img, sweep["winner_image"], wres, sweep["elapsed"])
+            out["report"]["sweep"] = _clean_sweep(sweep["sweep"])
+            out["report"]["processingTimeS"] = round(time.time() - t0, 2)
+            out["winner"] = {"file": sweep["winner_row"]["file"],
+                             "score": float(sweep["winner_row"]["score"])}
+            meta = hf_parse_metadata(sweep["winner_row"]["file"])
             job["meta"] = {
                 **job["meta"],
-                "referenceFrameId": winner.get("file", "archive"),
+                "referenceFrameId": sweep["winner_row"]["file"],
                 "referenceSunElevationDeg": 0,
                 "sunDeltaDeg": 0,
             }
-            job["pairLabel"] = f"{job['meta']['sourceSensor']} → {winner.get('file', 'archive')} · live sweep"
+            job["pairLabel"] = (
+                f"{job['meta']['sourceSensor']} → {sweep['winner_row']['file']} · HF sweep"
+            )
 
         job_dir = OUT_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -102,6 +207,9 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
         }
         job["status"] = "SUCCEEDED"
         job["currentStage"] = "evaluation"
+        if out.get("report", {}).get("reliability") == "failed":
+            job["status"] = "FAILED"
+            job["errorMessage"] = out["report"].get("reliabilityReason", "Registration failed")
     except LunarValidationError as exc:
         job["status"] = "FAILED"
         job["currentStage"] = "outlier_rejection"
@@ -115,6 +223,7 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
         job["completedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         with _lock:
             jobs[job_id] = job
+            _save_jobs()
 
 
 def _public_job(job: dict) -> dict:
@@ -123,7 +232,11 @@ def _public_job(job: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "jobs": len(jobs)}
+    try:
+        hfs = hf_status()
+    except Exception as exc:
+        hfs = {"error": str(exc)[:200]}
+    return {"ok": True, "jobs": len(jobs), "hf": hfs}
 
 
 @app.get("/api/jobs")
@@ -170,6 +283,7 @@ def create_job(
     }
     with _lock:
         jobs[job_id] = job
+        _save_jobs()
     background.add_task(_run_job, job_id, src_bytes, ref_bytes)
     return {"jobId": job_id, "job": _public_job(job)}
 

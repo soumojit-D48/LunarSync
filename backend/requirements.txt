@@ -1,7 +1,9 @@
 fastapi
 uvicorn
 python-multipart
+python-dotenv
 numpy
 opencv-python-headless
+huggingface_hub
 torch --index-url https://download.pytorch.org/whl/cpu
 kornia
