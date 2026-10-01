@@ -103,7 +103,7 @@ function Progress({ stage }: { stage: string }) {
 }
 
 export default function JobDetail({ id }: { id: string }) {
-  const { job, result, error } = useJob(id);
+  const { job, result, error, reconnecting } = useJob(id);
 
   return (
     <div className="relative min-h-screen bg-void text-bone">
@@ -116,7 +116,9 @@ export default function JobDetail({ id }: { id: string }) {
         {error ? (
           <p className="mt-8 font-mono text-sm text-destructive">Failed to load job: {error}</p>
         ) : !job ? (
-          <p className="mt-8 font-mono text-sm text-mist">Loading job…</p>
+          <p className="mt-8 font-mono text-sm text-mist">
+            {reconnecting ? "Backend waking up (free tier sleeps) — still polling…" : "Loading job…"}
+          </p>
         ) : (
           <div className="mt-4">
             <div className="flex flex-wrap items-center gap-3">

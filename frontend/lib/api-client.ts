@@ -66,7 +66,7 @@ export function getBackendMode() {
 
 export function listReferences() {
   return fetch(`${BASE}/references`).then((r) =>
-    json<{ references: CloudReference[]; mode?: string }>(r),
+    json<{ references: CloudReference[]; mode?: string; warning?: string }>(r),
   );
 }
 

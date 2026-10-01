@@ -149,16 +149,6 @@ export default function JobsPage() {
           Every source↔reference pair queued through the pipeline, with live status,
           match evidence and evaluation on the detail page.
         </p>
-        <p className="mt-3 font-mono text-[11px] tracking-[0.14em]">
-          <span className="text-ash">REFERENCE SET: </span>
-          <span className="text-signal">
-            {mode === "cloud"
-              ? `CLOUD · SEEDED SET${refCount !== null ? ` (${refCount})` : ""} — manage at /references`
-              : mode === "hf"
-                ? "HUGGING FACE ARCHIVE"
-                : mode.toUpperCase()}
-          </span>
-        </p>
 
         <div className="mt-8">
           <NewJobCard onCreated={(id) => router.push(`/jobs/${id}`)} />

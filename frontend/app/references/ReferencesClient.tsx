@@ -18,6 +18,7 @@ const inputCls =
 export default function ReferencesPage() {
   const [refs, setRefs] = useState<CloudReference[] | null>(null);
   const [mode, setMode] = useState<string>("…");
+  const [backendDown, setBackendDown] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [lat, setLat] = useState("");
   const [lon, setLon] = useState("");
@@ -28,7 +29,8 @@ export default function ReferencesPage() {
     try {
       const [r, m] = await Promise.all([listReferences(), getBackendMode()]);
       setRefs(r.references ?? []);
-      setMode(m.mode ?? "unknown");
+      setMode(r.warning ? "waking…" : (m.mode ?? "unknown"));
+      setBackendDown(Boolean(r.warning));
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     }
@@ -78,8 +80,14 @@ export default function ReferencesPage() {
           compared <em>only</em> against this set with the same SIFT + outlier-rejection logic as the
           HF archive. Current backend mode:{" "}
           <span className="font-mono text-signal">{mode}</span>
-          {mode !== "cloud" ? " (uploads still work; switch the backend env to use them for matching)" : null}
+          {mode !== "cloud" && !backendDown ? " (uploads still work; switch the backend env to use them for matching)" : null}
         </p>
+        {backendDown ? (
+          <p className="mt-3 rounded-md px-3 py-2 font-mono text-[11px] tracking-[0.08em] text-amber-300 ring-1 ring-amber-300/30">
+            BACKEND UNREACHABLE — Render free tier sleeps after 15 min idle. Wait ~1 min and refresh;
+            your seeded photos are safe in Neon/Cloudinary.
+          </p>
+        ) : null}
 
         <div className="mt-8 grid gap-6 lg:grid-cols-[380px_1fr]">
           <div className="panel-glass h-fit rounded-xl p-5 ring-1 ring-white/10">
