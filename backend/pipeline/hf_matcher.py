@@ -12,6 +12,7 @@ backend stays fully dynamic: no static data/reference/ required.
 """
 
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -23,10 +24,12 @@ logger = logging.getLogger("LunaMatch.hf_matcher")
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
-MAX_FEATURES = 4000
+# Tunable via env: free-tier instances (0.1 CPU) want these low.
+# 2500 features is still plenty for SIFT + ratio-test matching.
+MAX_FEATURES = int(os.getenv("SWEEP_MAX_FEATURES", "2500") or 2500)
+FEATURE_MAX_DIM = int(os.getenv("SWEEP_FEATURE_MAX_DIM", "1200") or 1200)
 SIFT_CONTRAST = 0.01
 SIFT_EDGE = 10
-FEATURE_MAX_DIM = 1500
 RATIO_THRESHOLDS = (0.75, 0.80, 0.85)
 RANSAC_THRESH = 5.0
 MAX_ITERS = 3000
@@ -459,7 +462,8 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
         raise ValueError("Query texture starvation: insufficient interest landmarks.")
     paths = ref_paths[:limit] if limit else ref_paths
     sweep_rows, best, best_path, best_db, best_res = [], None, None, None, None
-    for p in paths:
+    total = len(paths)
+    for n, p in enumerate(paths, start=1):
         report("matching")
         try:
             arr = np.frombuffer(Path(p).read_bytes(), dtype=np.uint8)
@@ -484,6 +488,9 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
                "iou": round(res["iou"], 1), "model": res["model"],
                "runtimeS": res["runtime"]}
         sweep_rows.append(row)
+        if n == 1 or n % 10 == 0 or n == total:
+            logger.info("sweep %d/%d: %s score=%.1f inliers=%d",
+                        n, total, row["file"], row["score"], row["inliers"])
         if best is None or row["score"] > best["score"]:
             best, best_path, best_db, best_res = dict(row), p, db_img, res
         if row["score"] >= early_stop:
