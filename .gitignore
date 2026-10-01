@@ -93,6 +93,8 @@ dmypy.json
 
 # LunaMatch demo backend artifacts (per-job outputs, local uploads)
 backend/static/outputs/
+backend/static/cloud_cache/
+backend/static/jobs.json
 backend/data/uploads/
 
 # =========================

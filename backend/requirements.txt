@@ -5,5 +5,7 @@ python-dotenv
 numpy
 opencv-python-headless
 huggingface_hub
+cloudinary
+psycopg[binary]
 torch --index-url https://download.pytorch.org/whl/cpu
 kornia

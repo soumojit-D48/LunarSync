@@ -92,6 +92,22 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ path: stri
 
   const s = getStore();
 
+  // Reference-registry + backend-mode passthrough (cloud seeding UI).
+  if (segments.length === 1 && segments[0] === "references") {
+    try {
+      return NextResponse.json(await fromBackend("references"));
+    } catch {
+      return NextResponse.json({ references: [], mode: "unknown", warning: "backend unreachable" });
+    }
+  }
+  if (segments.length === 1 && segments[0] === "reference-backend") {
+    try {
+      return NextResponse.json(await fromBackend("reference-backend"));
+    } catch {
+      return NextResponse.json({ mode: "unknown", warning: "backend unreachable" });
+    }
+  }
+
   if (segments.length === 1 && segments[0] === "jobs") {
     const mockJobs = [...s.values()].map((f) => f.job);
     try {
@@ -126,11 +142,29 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ path: stri
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   const segments = (await ctx.params).path ?? [];
+  const contentType = req.headers.get("content-type") ?? "";
+  // Reference seeding (Cloudinary + Neon) — forward multipart to backend.
+  if (segments.length === 1 && segments[0] === "references") {
+    if (!contentType.includes("multipart/form-data")) {
+      return NextResponse.json({ error: "expected multipart upload" }, { status: 400 });
+    }
+    try {
+      const form = await req.formData();
+      const r = await fetch(`${BACKEND}/api/references`, { method: "POST", body: form });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) return NextResponse.json(body, { status: r.status });
+      return NextResponse.json(body, { status: 201 });
+    } catch (e) {
+      return NextResponse.json(
+        { error: `live backend unreachable (${e instanceof Error ? e.message : "error"})` },
+        { status: 502 },
+      );
+    }
+  }
   if (segments.length !== 1 || segments[0] !== "jobs") {
     return NextResponse.json({ error: "unknown endpoint" }, { status: 404 });
   }
   // Real upload with file bytes → forward to the live backend (notebook pipeline).
-  const contentType = req.headers.get("content-type") ?? "";
   if (contentType.includes("multipart/form-data")) {
     try {
       const form = await req.formData();
@@ -193,6 +227,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
   store = next;
   polls.set(id, 0);
   return NextResponse.json({ jobId: id, job: fixture.job }, { status: 201 });
+}
+
+export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  const segments = (await ctx.params).path ?? [];
+  if (segments.length === 2 && segments[0] === "references") {
+    try {
+      const r = await fetch(`${BACKEND}/api/references/${segments[1]}`, { method: "DELETE" });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) return NextResponse.json(body, { status: r.status });
+      return NextResponse.json(body);
+    } catch (e) {
+      return NextResponse.json(
+        { error: `live backend unreachable (${e instanceof Error ? e.message : "error"})` },
+        { status: 502 },
+      );
+    }
+  }
+  return NextResponse.json({ error: "unknown endpoint" }, { status: 404 });
 }
 
 export type { Job, JobFixture };

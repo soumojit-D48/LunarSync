@@ -489,7 +489,7 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
         if row["score"] >= early_stop:
             break
     if best is None or best_res is None:
-        raise ValueError("No correspondence found in the HF archive.")
+        raise ValueError("No correspondence found in the reference set.")
     report("outlier_rejection")
     winner_res = _refine_winner(query_img, best_db, best_res)
     report("subpixel_refinement")

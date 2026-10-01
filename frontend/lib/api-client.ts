@@ -13,7 +13,16 @@ export type { EvaluationReport, Job, JobResult, MatcherType, MatchPoint, Transfo
 const BASE = "/api/proxy";
 
 async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`API ${res.status}`);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = (body as any)?.detail ?? (body as any)?.error ?? "";
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail ? `API ${res.status}: ${detail}` : `API ${res.status}`);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -35,6 +44,46 @@ export function getMatches(id: string) {
 
 export function getReport(id: string) {
   return fetch(`${BASE}/jobs/${id}/report`).then((r) => json<{ report: EvaluationReport }>(r));
+}
+
+export type CloudReference = {
+  id: string;
+  publicId?: string;
+  secureUrl: string;
+  filename: string;
+  lat?: string | null;
+  lon?: string | null;
+  width?: number | null;
+  height?: number | null;
+  createdAt?: string;
+};
+
+export function getBackendMode() {
+  return fetch(`${BASE}/reference-backend`).then((r) =>
+    json<{ mode: string; cloud?: any; hf?: any }>(r),
+  );
+}
+
+export function listReferences() {
+  return fetch(`${BASE}/references`).then((r) =>
+    json<{ references: CloudReference[]; mode?: string }>(r),
+  );
+}
+
+export function uploadReference(input: { file: File; lat?: string; lon?: string }) {
+  const form = new FormData();
+  form.append("file", input.file);
+  if (input.lat) form.append("lat", input.lat);
+  if (input.lon) form.append("lon", input.lon);
+  return fetch(`${BASE}/references`, { method: "POST", body: form }).then((r) =>
+    json<{ reference: CloudReference }>(r),
+  );
+}
+
+export function deleteReference(id: string) {
+  return fetch(`${BASE}/references/${id}`, { method: "DELETE" }).then((r) =>
+    json<{ deleted: string }>(r),
+  );
 }
 
 export function createJob(input: {

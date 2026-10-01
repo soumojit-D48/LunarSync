@@ -3,7 +3,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowRight, Upload } from "lucide-react";
-import { createJob, listJobs, type Job, type MatcherType, type TransformModel } from "@/lib/api-client";
+import { createJob, getBackendMode, listJobs, type Job, type MatcherType, type TransformModel } from "@/lib/api-client";
 import { MATCHER_LABELS } from "@/lib/mock-data";
 import { JobStatusBadge } from "@/components/jobs/JobStatusBadge";
 import { ConsoleNav } from "@/components/ConsoleNav";
@@ -67,8 +67,8 @@ function NewJobCard({ onCreated }: { onCreated: (id: string) => void }) {
       </label>
       <p className="mt-3 font-mono text-[10px] leading-relaxed tracking-[0.08em] text-ash">
         {srcFile
-          ? "LIVE BACKEND — YOUR FILE IS SWEPT AGAINST ALL 16 ARCHIVE FRAMES."
-          : "REFERENCE FRAMES ARE SERVED FROM THE BUILT-IN LRO / SELENE ARCHIVE — UPLOAD ONLY YOUR SOURCE FRAME."}
+          ? "LIVE BACKEND — YOUR FILE IS SWEPT AGAINST THE ACTIVE REFERENCE SET (SEE MODE BADGE ABOVE)."
+          : "REFERENCE FRAMES COME FROM THE ACTIVE BACKEND SET — UPLOAD ONLY YOUR SOURCE FRAME."}
       </p>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <Field label="SOURCE SENSOR">
@@ -114,6 +114,8 @@ export default function JobsPage() {
   const router = useRouter();
   const [jobs, setJobs] = useState<Job[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<string>("…");
+  const [refCount, setRefCount] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -124,6 +126,14 @@ export default function JobsPage() {
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : "failed");
       });
+    getBackendMode()
+      .then((m) => {
+        if (cancelled) return;
+        setMode(m.mode ?? "unknown");
+        const n = m.cloud?.seeded_count;
+        if (typeof n === "number") setRefCount(n);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -138,6 +148,16 @@ export default function JobsPage() {
         <p className="mt-2 max-w-[60ch] text-sm text-mist">
           Every source↔reference pair queued through the pipeline, with live status,
           match evidence and evaluation on the detail page.
+        </p>
+        <p className="mt-3 font-mono text-[11px] tracking-[0.14em]">
+          <span className="text-ash">REFERENCE SET: </span>
+          <span className="text-signal">
+            {mode === "cloud"
+              ? `CLOUD · SEEDED SET${refCount !== null ? ` (${refCount})` : ""} — manage at /references`
+              : mode === "hf"
+                ? "HUGGING FACE ARCHIVE"
+                : mode.toUpperCase()}
+          </span>
         </p>
 
         <div className="mt-8">
