@@ -19,9 +19,20 @@ const polls = new Map<string, number>();
 const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8000";
 
 async function fromBackend(path: string, init?: RequestInit) {
-  const r = await fetch(`${BACKEND}/api/${path}`, { ...init, cache: "no-store" });
-  if (!r.ok) throw new Error(`backend ${r.status}`);
-  return r.json();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const r = await fetch(`${BACKEND}/api/${path}`, { ...init, cache: "no-store", signal: ctrl.signal });
+    if (r.status === 404) {
+      const e = new Error("backend 404") as Error & { backend404?: boolean };
+      e.backend404 = true;
+      throw e;
+    }
+    if (!r.ok) throw new Error(`backend ${r.status}`);
+    return r.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function withProxyImages(result: any) {
@@ -29,7 +40,13 @@ function withProxyImages(result: any) {
     const id = result.job?.id ?? "";
     const images: Record<string, string> = {};
     for (const [k, v] of Object.entries(result.images)) {
-      const name = String(v).split("/").pop();
+      const url = String(v);
+      // Absolute URLs (e.g. Cloudinary results persisted in Neon) pass through.
+      if (/^https?:\/\//.test(url)) {
+        images[k] = url;
+        continue;
+      }
+      const name = url.split("/").pop();
       images[k] = `/api/proxy/files/${id}/${name}`;
     }
     return { ...result, images };
@@ -79,14 +96,21 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ path: stri
   }
 
   // Live-backend jobs (live-*) go straight to FastAPI; mock jobs (job-*)
-  // are served locally. No cross-talk, no 404 noise in the backend log.
-  // (The /jobs list is merged further below.)
+  // are served locally. A real backend 404 falls through to the mock store;
+  // anything else (waking backend, slow sweep, timeout) returns 502 so the
+  // client keeps polling instead of showing a fake "job not found".
   if (segments.length >= 2 && segments[0] === "jobs" && segments[1].startsWith("live-")) {
     try {
       const data = await fromBackend(segments.join("/"));
       return NextResponse.json(data?.job && data?.matches ? withProxyImages(data) : data);
-    } catch {
-      /* fall through to mock (404 there if truly unknown) */
+    } catch (e) {
+      if (!(e as { backend404?: boolean })?.backend404) {
+        return NextResponse.json(
+          { error: `backend not answering (${e instanceof Error ? e.message : "error"}) — retrying` },
+          { status: 502 },
+        );
+      }
+      /* backend 404: fall through to mock (404 there if truly unknown) */
     }
   }
 

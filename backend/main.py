@@ -84,6 +84,29 @@ app.add_middleware(
 jobs: dict = {}
 _lock = threading.Lock()
 
+try:
+    from pipeline import jobs_store as _js  # Neon persistence (best-effort)
+except Exception:
+    _js = None
+
+
+def _db_save_job(job: dict) -> None:
+    if _js is None:
+        return
+    try:
+        _js.save_job({k: v for k, v in job.items() if k not in ("result", "src_bytes", "ref_bytes")})
+    except Exception:
+        pass
+
+
+def _db_save_result(job_id: str, result: dict) -> None:
+    if _js is None:
+        return
+    try:
+        _js.save_result(job_id, result)
+    except Exception:
+        pass
+
 
 def _load_jobs():
     if JOB_STORE.exists():
@@ -179,14 +202,21 @@ def _cloud_files() -> list:
 
 def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
     job = jobs[job_id]
+    _db_save_job(job)  # durable from the start: restarts can't orphan it
     try:
         job["status"] = "RUNNING"
         job["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        _last_stage = {"name": ""}
 
         def on_stage(stage: str):
             job["currentStage"] = stage
             with _lock:
                 _save_jobs()
+            # Persist stage transitions only (sweep calls this per frame).
+            if stage != _last_stage["name"]:
+                _last_stage["name"] = stage
+                _db_save_job(job)
 
         if ref_bytes is not None:
             # Explicit pair: user uploaded both frames.
@@ -262,16 +292,27 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
         job_dir.mkdir(parents=True, exist_ok=True)
         for name, blob in out["images"].items():
             (job_dir / f"{name}.jpg").write_bytes(blob)
+        images = {
+            "source": f"/outputs/{job_id}/source.jpg",
+            "reference": f"/outputs/{job_id}/reference.jpg",
+            "warped": f"/outputs/{job_id}/warped.jpg",
+        }
+        # Push result images to Cloudinary so results survive restarts;
+        # absolute URLs pass the frontend proxy through untouched.
+        if _js is not None:
+            try:
+                remote = _js.upload_result_images(job_id, out["images"])
+                for k, url in remote.items():
+                    if url:
+                        images[k] = url
+            except Exception:
+                pass
         job["result"] = {
             "job": _public_job(job),
             "matches": out["matches"],
             "transform": out["transform"],
             "report": out["report"],
-            "images": {
-                "source": f"/outputs/{job_id}/source.jpg",
-                "reference": f"/outputs/{job_id}/reference.jpg",
-                "warped": f"/outputs/{job_id}/warped.jpg",
-            },
+            "images": images,
         }
         job["status"] = "SUCCEEDED"
         job["currentStage"] = "evaluation"
@@ -292,10 +333,22 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
         with _lock:
             jobs[job_id] = job
             _save_jobs()
+        _db_save_job(job)
+        if "result" in job:
+            _db_save_result(job_id, job["result"])
 
 
 def _public_job(job: dict) -> dict:
     return {k: v for k, v in job.items() if k not in ("result", "src_bytes", "ref_bytes")}
+
+
+def _db_url_ok() -> bool:
+    try:
+        from pipeline.cloud_store import db_url
+
+        return bool(db_url())
+    except Exception:
+        return False
 
 
 @app.get("/health")
@@ -308,8 +361,12 @@ def health():
         cs = cloud_status()
     except Exception as exc:
         cs = {"error": str(exc)[:200]}
+    try:
+        db = {"jobs_persisted": (_js is not None and bool(_db_url_ok()))}
+    except Exception:
+        db = {"jobs_persisted": False}
     return {"ok": True, "jobs": len(jobs), "hf": hfs, "cloud": cs,
-            "reference_backend": cloud_mode()}
+            "db": db, "reference_backend": cloud_mode()}
 
 
 @app.get("/api/reference-backend")
@@ -382,10 +439,48 @@ def remove_reference(ref_id: str):
     return {"deleted": ref_id}
 
 
+def _find_job(job_id: str) -> dict | None:
+    """Memory first (fast path), Neon fallback (survives restarts)."""
+    job = jobs.get(job_id)
+    if job is not None:
+        return job
+    if _js is None:
+        return None
+    try:
+        job = _js.load_job(job_id)
+    except Exception:
+        return None
+    if job is not None:
+        with _lock:
+            jobs[job_id] = job
+    return job
+
+
+def _find_result(job_id: str) -> dict | None:
+    job = jobs.get(job_id)
+    if job is not None and "result" in job:
+        return job["result"]
+    if _js is None:
+        return None
+    try:
+        return _js.load_result(job_id)
+    except Exception:
+        return None
+
+
 @app.get("/api/jobs")
 def list_jobs():
     with _lock:
         items = [_public_job(j) for j in jobs.values()]
+    # Merge Neon history (post-restart jobs memory never saw).
+    if _js is not None:
+        try:
+            seen = {j["id"] for j in items}
+            for j in _js.list_jobs():
+                if j.get("id") not in seen:
+                    items.append(_public_job(j))
+        except Exception:
+            pass
     return {"jobs": items}
 
 
@@ -427,13 +522,14 @@ def create_job(
     with _lock:
         jobs[job_id] = job
         _save_jobs()
+    _db_save_job(job)
     background.add_task(_run_job, job_id, src_bytes, ref_bytes)
     return {"jobId": job_id, "job": _public_job(job)}
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    job = jobs.get(job_id)
+    job = _find_job(job_id)
     if job is None:
         from fastapi import HTTPException
         raise HTTPException(404, "job not found")
@@ -442,11 +538,11 @@ def get_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/result")
 def get_result(job_id: str):
-    job = jobs.get(job_id)
-    if job is None or "result" not in job:
+    res = _find_result(job_id)
+    if res is None:
         from fastapi import HTTPException
         raise HTTPException(404, "result not ready")
-    return job["result"]
+    return res
 
 
 @app.get("/api/jobs/{job_id}/matches")
