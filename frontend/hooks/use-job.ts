@@ -32,6 +32,14 @@ export function useJob(id: string) {
           if (!cancelled) setResult(full);
         } else if (next.status === "FAILED") {
           stop();
+          // Best-effort evidence (ranked sweep + top-match viewer) is stored
+          // even on FAILED jobs — show the comparison, not just the verdict.
+          try {
+            const full = await getResult(id);
+            if (!cancelled) setResult(full);
+          } catch {
+            /* no evidence stored for this failure */
+          }
         }
       } catch (e) {
         if (cancelled) return;
