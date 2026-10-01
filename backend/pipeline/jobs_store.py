@@ -122,7 +122,8 @@ def upload_result_images(job_id: str, images: dict[str, bytes]) -> dict[str, str
     out: dict[str, str] = {}
     for name, blob in images.items():
         try:
-            up = cs.upload_image(blob, f"{job_id}-{name}.jpg")
+            up = cs.upload_image(blob, f"{job_id}-{name}.jpg",
+                                 folder="lunarsync-results")
             out[name] = up["secure_url"]
         except Exception as exc:
             logger.warning("Result image upload failed (%s): %s", name, exc)

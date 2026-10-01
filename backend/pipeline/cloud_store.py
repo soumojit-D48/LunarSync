@@ -139,7 +139,7 @@ def _cloudinary():
     return cloudinary
 
 
-def upload_image(data: bytes, filename: str) -> dict:
+def upload_image(data: bytes, filename: str, folder: str | None = None) -> dict:
     """Upload bytes to Cloudinary, return {public_id, secure_url, width, height}."""
     if not cloudinary_configured():
         raise RuntimeError(
@@ -149,7 +149,7 @@ def upload_image(data: bytes, filename: str) -> dict:
     import cloudinary.uploader  # type: ignore
 
     _cloudinary()
-    folder = _env("CLOUDINARY_FOLDER", "lunarsync-refs") or "lunarsync-refs"
+    target = folder or _env("CLOUDINARY_FOLDER", "lunarsync-refs") or "lunarsync-refs"
     # Temp-file upload (robust for all formats/sizes; data-URI posts are flaky).
     import tempfile
 
@@ -160,7 +160,7 @@ def upload_image(data: bytes, filename: str) -> dict:
         tmp.close()
         res = cloudinary.uploader.upload(
             tmp.name,
-            folder=folder,
+            folder=target,
             public_id=f"{Path(filename).stem}-{uuid.uuid4().hex[:6]}",
             resource_type="image",
             overwrite=False,
