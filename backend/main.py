@@ -62,10 +62,21 @@ STAGES = ["ingestion", "preprocessing", "overlap_estimation", "feature_extractio
           "matching", "outlier_rejection", "uniform_selection", "subpixel_refinement",
           "transform_fit", "warping", "evaluation"]
 
+def _allowed_origins() -> list:
+    """Only this frontend + local dev may call the API (env-driven)."""
+    raw = os.getenv("FRONTEND_URL", "") or ""
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        *origins,
+    ]
+
+
 app = FastAPI(title="LunaMatch demo backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=_allowed_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
