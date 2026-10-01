@@ -311,13 +311,17 @@ def compare_pair(q_img, q_kp, q_desc, db_img):
         attempts.append((f"mutual_{r:.2f}", _mutual(q_desc, db_desc, r)))
     attempts.append(("crosscheck", _crosscheck(q_desc, db_desc)))
 
-    best, best_fail = None, None
+    best, best_fail, best_any, longest = None, None, None, None
     for method, matches in attempts:
         if len(matches) < MIN_CANDIDATES:
             cand = {"method": method, "candidates": len(matches), "inliers": 0}
             if best_fail is None or len(matches) > best_fail["candidates"]:
                 best_fail = cand
+            if longest is None or len(matches) > len(longest[1]):
+                longest = (method, matches)
             continue
+        if longest is None or len(matches) > len(longest[1]):
+            longest = (method, matches)
         src = np.float32([q_kp[m.queryIdx].pt for m in matches])
         dst = np.float32([db_kp[m.trainIdx].pt for m in matches])
         cands = [g for g in (_est_partial(src, dst), _est_full(src, dst), _est_h(src, dst)) if g]
@@ -328,9 +332,15 @@ def compare_pair(q_img, q_kp, q_desc, db_img):
             g["cells"], g["coverage"] = cells, cov
             ok, ar = _footprint(g["matrix"], g["model"], q_img.shape)
             g["valid"], g["area_ratio"] = ok, ar
+        cands.sort(key=_key, reverse=True)
+        # Strongest geometry regardless of gates — best-effort fallback.
+        if best_any is None or _key(cands[0]) > _key(best_any["geo"]):
+            top = cands[0]
+            ov0, iou0 = _overlap(q_img, db_img, top["matrix"], top["model"])
+            best_any = {"geo": top, "src": src, "dst": dst, "matches": matches,
+                        "method": method, "overlap": ov0, "iou": iou0}
         usable = [g for g in cands if g["valid"] and g["inliers"] >= MIN_INLIERS
                   and g["inlier_ratio"] >= MIN_RATIO and g["cells"] >= MIN_CELLS]
-        cands.sort(key=_key, reverse=True)
         if not usable:
             fb = cands[0]
             diag = {"method": method, "candidates": len(matches),
@@ -349,7 +359,7 @@ def compare_pair(q_img, q_kp, q_desc, db_img):
     if best is None:
         fail.update({"candidates": (best_fail or {}).get("candidates", 0),
                      "inliers": (best_fail or {}).get("inliers", 0)})
-        return None, fail
+        return None, fail, _best_effort(q_img, best_any, longest, q_kp, db_kp, t0)
     g = best["geo"]
     ov, iou = best["overlap"], best["iou"]
     score = g["inlier_ratio"] * 100.0 * (0.5 + 0.5 * min(g["cells"] / 16.0, 1.0))
@@ -364,7 +374,61 @@ def compare_pair(q_img, q_kp, q_desc, db_img):
         "matrix": g["matrix"], "mask": g["mask"],
         "runtime": round(time.time() - t0, 2),
     }
-    return result, None
+    return result, None, None
+
+
+def _gate_reasons(g) -> str:
+    """Human-readable list of gates a geometry candidate failed."""
+    reasons = []
+    if g["inliers"] < MIN_INLIERS:
+        reasons.append(f"only {g['inliers']} inliers (need {MIN_INLIERS})")
+    if g["inlier_ratio"] < MIN_RATIO:
+        reasons.append(f"inlier ratio {g['inlier_ratio']:.2f} (need {MIN_RATIO})")
+    if g.get("cells", 0) < MIN_CELLS:
+        reasons.append(f"covers {g.get('cells', 0)} grid cells (need {MIN_CELLS})")
+    if not g.get("valid", False):
+        reasons.append("warped footprint invalid")
+    return "; ".join(reasons) or "below quality gates"
+
+
+def _best_effort(q_img, best_any, longest, q_kp, db_kp, t0):
+    """Strongest available evidence when nothing passes the gates.
+
+    Returns a result-shaped dict flagged weak=True so the caller returns the
+    top-similarity photo with an honest failed verdict instead of an error.
+    """
+    if best_any is not None:
+        g = best_any["geo"]
+        score = g["inlier_ratio"] * 100.0 * (0.5 + 0.5 * min(g["cells"] / 16.0, 1.0))
+        return {
+            "method": best_any["method"] + " (unverified)",
+            "src": best_any["src"], "dst": best_any["dst"],
+            "mask": g["mask"], "matrix": g["matrix"], "model": g["model"],
+            "inliers": g["inliers"], "inlier_ratio": g["inlier_ratio"],
+            "cells": g["cells"], "coverage": g["coverage"],
+            "rmse": g["sym_rmse"], "overlap": best_any["overlap"],
+            "iou": best_any["iou"], "score": score,
+            "runtime": round(time.time() - t0, 2),
+            "weak": True, "weak_reason": f"Best photo, but unreliable: {_gate_reasons(g)}.",
+        }
+    if longest is not None and len(longest[1]) > 0:
+        method, matches = longest
+        src = np.float32([q_kp[m.queryIdx].pt for m in matches])
+        dst = np.float32([db_kp[m.trainIdx].pt for m in matches])
+        cells, cov = _coverage(src, q_img.shape)
+        return {
+            "method": method + " (unverified)",
+            "src": src, "dst": dst,
+            "mask": np.zeros(len(matches), dtype=bool),
+            "matrix": np.eye(3, dtype=float), "model": "homography",
+            "inliers": 0, "inlier_ratio": 0.0,
+            "cells": cells, "coverage": cov,
+            "rmse": 0.0, "overlap": 0.0, "iou": 0.0, "score": 0.0,
+            "runtime": round(time.time() - t0, 2),
+            "weak": True,
+            "weak_reason": "Best photo, but unreliable: no geometric consensus at all.",
+        }
+    return None
 
 
 def _refine_winner(q_img, db_img, res):
@@ -462,6 +526,7 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
         raise ValueError("Query texture starvation: insufficient interest landmarks.")
     paths = ref_paths[:limit] if limit else ref_paths
     sweep_rows, best, best_path, best_db, best_res = [], None, None, None, None
+    effort, effort_path, effort_db = None, None, None
     total = len(paths)
     for n, p in enumerate(paths, start=1):
         report("matching")
@@ -474,13 +539,19 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
             sweep_rows.append({"file": Path(p).name, "score": 0.0,
                                "inliers": 0, "rmse": 0.0, "error": str(exc)[:120]})
             continue
-        res, fail = compare_pair(query_img, q_kp, q_desc, db_img)
+        res, fail, weak = compare_pair(query_img, q_kp, q_desc, db_img)
         meta = parse_metadata(Path(p).name)
         if res is None:
+            wscore = round(weak["score"], 2) if weak else 0.0
             sweep_rows.append({"file": Path(p).name, "lat": meta.get("lat", "?"),
-                               "lon": meta.get("lon", "?"), "score": 0.0,
-                               "inliers": (fail or {}).get("inliers", 0), "rmse": 0.0,
-                               "runtimeS": 0.0})
+                               "lon": meta.get("lon", "?"), "score": wscore,
+                               "inliers": weak["inliers"] if weak else (fail or {}).get("inliers", 0),
+                               "rmse": round(weak["rmse"], 3) if weak else 0.0,
+                               "runtimeS": weak["runtime"] if weak else 0.0})
+            if weak is not None and (effort is None or
+                    (weak["inliers"], weak["inlier_ratio"], weak["score"]) >
+                    (effort["inliers"], effort["inlier_ratio"], effort["score"])):
+                effort, effort_path, effort_db = weak, p, db_img
             continue
         row = {"file": Path(p).name, "lat": meta.get("lat", "?"), "lon": meta.get("lon", "?"),
                "score": round(res["score"], 2), "inliers": res["inliers"],
@@ -496,9 +567,25 @@ def sweep(query_img: np.ndarray, ref_paths: list[Path], on_stage=None,
         if row["score"] >= early_stop:
             break
     if best is None or best_res is None:
-        raise ValueError("No correspondence found in the reference set.")
-    report("outlier_rejection")
-    winner_res = _refine_winner(query_img, best_db, best_res)
+        if effort is None:
+            raise ValueError("No correspondence found in the reference set.")
+        # Best-effort: return the top-similarity photo with an honest verdict
+        # instead of an error. No subpixel refinement on unverified geometry.
+        report("outlier_rejection")
+        meta = parse_metadata(effort_path.name)
+        best = {"file": effort_path.name, "lat": meta.get("lat", "?"),
+                "lon": meta.get("lon", "?"), "score": round(effort["score"], 2),
+                "inliers": effort["inliers"], "rmse": round(effort["rmse"], 3),
+                "overlap": round(effort["overlap"], 1), "iou": round(effort["iou"], 1),
+                "model": effort["model"], "runtimeS": effort["runtime"],
+                "unverified": True}
+        logger.info("best-effort winner: %s score=%.1f (%s)",
+                    best["file"], best["score"], effort.get("weak_reason", "weak"))
+        winner_res = effort
+        best_db = effort_db
+    else:
+        report("outlier_rejection")
+        winner_res = _refine_winner(query_img, best_db, best_res)
     report("subpixel_refinement")
     sweep_rows.sort(key=lambda e: e["score"], reverse=True)
     return {"winner_row": best, "winner_path": best_path, "winner_image": best_db,
@@ -545,7 +632,11 @@ def to_frontend(query_img: np.ndarray, db_img: np.ndarray, res: dict, elapsed: f
     cells = {(min(7, int(m["srcX"] * 8)), min(5, int(m["srcY"] * 6))) for m in matches if m["isInlier"]}
     coverage = len(cells) / 48.0
     n_in, ratio, rmse = res["inliers"], res["inlier_ratio"], res["rmse"]
-    if n_in >= 10 and ratio >= 0.10 and res.get("overlap", 0) >= 10.0 and rmse <= 6.0:
+    if res.get("weak"):
+        # Best-effort winner: top similarity, explicitly not verified.
+        reliability = "failed"
+        reason = res.get("weak_reason") or "Best match shown, but not verified."
+    elif n_in >= 10 and ratio >= 0.10 and res.get("overlap", 0) >= 10.0 and rmse <= 6.0:
         reliability, reason = "high", None
     elif n_in >= 6 and ratio >= 0.08:
         reliability, reason = "low", "Weak geometry — treat alignment as uncertain."
