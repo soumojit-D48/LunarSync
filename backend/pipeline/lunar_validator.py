@@ -34,11 +34,23 @@ def validate_lunar_image(gray: np.ndarray) -> dict:
     if gray is None or gray.size == 0:
         raise LunarValidationError("Image is empty or could not be decoded.")
 
-    h, w = gray.shape
-    if h < 50 or w < 50:
+    orig_h, orig_w = gray.shape
+    if orig_h < 50 or orig_w < 50:
         raise LunarValidationError(
-            f"Image too small ({w}x{h}). Minimum 50x50 required."
+            f"Image too small ({orig_w}x{orig_h}). Minimum 50x50 required."
         )
+
+    # Validate a downscaled copy: SIFT/Canny/Hough on multi-MP uploads take
+    # minutes on tiny instances, while the verdict is identical at 1024px.
+    import os as _os
+
+    _max = int(_os.getenv("VALIDATE_MAX_DIM", "1024") or 1024)
+    if max(orig_h, orig_w) > _max:
+        _s = _max / max(orig_h, orig_w)
+        gray = cv2.resize(gray, (int(orig_w * _s), int(orig_h * _s)),
+                          interpolation=cv2.INTER_AREA)
+
+    h, w = gray.shape
 
     # Check 1: Not blank/uniform
     std_dev = float(np.std(gray))
@@ -91,16 +103,24 @@ def validate_lunar_image(gray: np.ndarray) -> dict:
             {"edge_density": edge_density},
         )
 
-    # Check 6: Reject obvious diagrams/screenshots (many straight lines)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=min(h, w) // 6, maxLineGap=15)
-    if lines is not None:
-        n_lines = len(lines)
-        line_ratio = n_lines / (h * w) * 10000
-        if line_ratio > 8.0:
-            raise LunarValidationError(
-                "Image appears to be a diagram or screenshot. Upload a lunar surface photo.",
-                {"line_ratio": round(line_ratio, 2), "n_lines": n_lines},
-            )
+    # Check 6: Reject obvious diagrams/screenshots (many straight lines).
+    # Scale-invariant form: the length gate scales with the validation
+    # downscale factor and the count normalizes by ORIGINAL area, reproducing
+    # full-resolution semantics. Skipped on degenerate slivers (short side
+    # < 128px, e.g. downscaled long strips) where Hough output is noise.
+    _s = min(h, w) / max(min(orig_h, orig_w), 1)
+    if min(h, w) >= 128:
+        _min_len = max(10, int(min(orig_h, orig_w) // 6 * _s))
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                                minLineLength=_min_len, maxLineGap=15)
+        if lines is not None:
+            n_lines = len(lines)
+            line_ratio = n_lines / (orig_h * orig_w) * 10000
+            if line_ratio > 8.0:
+                raise LunarValidationError(
+                    "Image appears to be a diagram or screenshot. Upload a lunar surface photo.",
+                    {"line_ratio": round(line_ratio, 2), "n_lines": n_lines},
+                )
 
     return {
         "valid": True,
@@ -110,7 +130,7 @@ def validate_lunar_image(gray: np.ndarray) -> dict:
         "std_dev": round(std_dev, 1),
         "dynamic_range": round(dynamic_range, 1),
         "edge_density": round(edge_density, 4),
-        "dimensions": f"{w}x{h}",
+        "dimensions": f"{orig_w}x{orig_h}",
     }
 
 

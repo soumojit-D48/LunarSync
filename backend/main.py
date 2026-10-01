@@ -11,11 +11,14 @@ Neon holds only the cloud reference registry.
 """
 
 import json
+import logging
 import os
 import threading
 import time
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger("LunaMatch.jobs")
 
 import cv2
 import numpy as np
@@ -230,9 +233,13 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
             t0 = time.time()
             on_stage("ingestion")
             query_img = _decode_gray(src_bytes)
+            logger.info("job %s: decoded %s", job_id, query_img.shape)
             on_stage("preprocessing")
             validate_lunar_image(query_img)
+            logger.info("job %s: validated in %.1fs", job_id, time.time() - t0)
             files = _cloud_files()
+            logger.info("job %s: %d cloud refs materialized in %.1fs",
+                        job_id, len(files), time.time() - t0)
             if not files:
                 raise RuntimeError(
                     "Cloud set empty: seed references first at /references "
@@ -321,7 +328,7 @@ def _run_job(job_id: str, src_bytes: bytes, ref_bytes: bytes | None):
             job["errorMessage"] = out["report"].get("reliabilityReason", "Registration failed")
     except LunarValidationError as exc:
         job["status"] = "FAILED"
-        job["currentStage"] = "outlier_rejection"
+        job["currentStage"] = "preprocessing"
         job["errorMessage"] = exc.reason
         if exc.details:
             job["validation"] = exc.details

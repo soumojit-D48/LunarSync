@@ -196,6 +196,7 @@ def materialize(refs: list[dict]) -> list[Path]:
     Cache hit avoids re-download. Same gray-decode path as HF frames, so
     hf_matcher.sweep() runs identical logic over this smaller set.
     """
+    import time
     import urllib.request
 
     paths: list[Path] = []
@@ -205,9 +206,22 @@ def materialize(refs: list[dict]) -> list[Path]:
             continue
         dest = CLOUD_CACHE / _safe_name(r.get("publicId") or r.get("id", "ref"))
         if not dest.exists() or dest.stat().st_size == 0:
-            req = urllib.request.Request(url, headers={"User-Agent": "LunaMatch/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as f:
-                f.write(resp.read())
+            t0 = time.time()
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "LunaMatch/1.0"})
+                with urllib.request.urlopen(req, timeout=12) as resp, open(dest, "wb") as f:
+                    f.write(resp.read())
+                logger.info("materialized %s (%d KB in %.1fs)",
+                            r.get("filename"), dest.stat().st_size // 1024,
+                            time.time() - t0)
+            except Exception as exc:
+                logger.warning("materialize failed for %s: %s", r.get("filename"), exc)
+                try:
+                    if dest.exists():
+                        dest.unlink()
+                except Exception:
+                    pass
+                continue
         # Name the Path after the original filename so metadata parsing works.
         alias = CLOUD_CACHE / (r.get("filename") or dest.name)
         if alias != dest and not alias.exists():
